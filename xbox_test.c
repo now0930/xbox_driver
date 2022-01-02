@@ -7,11 +7,11 @@
 #include <linux/usb/input.h>
 #include <linux/slab.h>
 #define USB_XBOX_MINOR_BASE	1
-//구조체 선언.
+//사용할 구조체 선언.
 struct usb_xpad{
 	struct input_dev *dev;		/* input device interface */
-	struct usb_device *udev;	/* usb device */
 	struct usb_interface *intf;	/* usb interface */
+	struct usb_device *udev;	/* usb device */
 	__u8    irq_in_endpointAddr;    /* interrupt in address*/
 	__u8    irq_out_endpointAddr;   /* interrupt out address*/
 	struct usb_endpoint_descriptor *endpoint_in, *endpoint_out;
@@ -88,7 +88,7 @@ static int xbox_flush(struct file *file, fl_owner_t id)
 {
 	return 0;
 }
-static const struct file_operations xboxtest_fops = {
+static const struct file_operations xbox360_fops = {
 	.owner =	THIS_MODULE,
 	.read =		xbox_read,
 	.write =	xbox_write,
@@ -102,8 +102,8 @@ static const struct file_operations xboxtest_fops = {
  * and to have the device registered with the driver core
  */
 static struct usb_class_driver xbox_class = {
-	.name =		"xbox%d",
-	.fops =		&xboxtest_fops,
+	.name =		"xbox360 driver%d",
+	.fops =		&xbox360_fops,
 	.minor_base =	USB_XBOX_MINOR_BASE,
 };
 static struct usb_driver xpad_test_driver;
@@ -128,7 +128,7 @@ static int xpad_init_input(struct usb_xpad *xpad)
 	if (!input_dev)
 		return -ENOMEM;
 	xpad->dev = input_dev;
-	input_dev->name  = "test xbox360";
+	input_dev->name  = "xbox360";
 
 
 	set_bit(EV_KEY, input_dev->evbit);
@@ -139,7 +139,7 @@ static int xpad_init_input(struct usb_xpad *xpad)
 	strlcat(xpad->phys, "/input0", sizeof(xpad->phys));
 	usb_to_input_id(xpad->udev, &input_dev->id);
 	input_dev->dev.parent = &xpad->intf->dev;
-	
+
 	/* set up standard buttons */
 	for (i = 0; xpad_common_btn[i] >= 0; i++)
 		input_set_capability(input_dev, EV_KEY, xpad_common_btn[i]);
@@ -196,11 +196,12 @@ static void xpad_close(struct input_dev *dev)
 static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_xpad *xpad;
-	struct usb_device *udev;
-	struct usb_endpoint_descriptor *ep_irq_in,*ep_irq_out;
-	struct usb_host_interface *intf_tmp;
+	//struct usb_device *udev;
+	//struct usb_endpoint_descriptor *ep_irq_in,*ep_irq_out;
+	//struct usb_host_interface *intf_tmp;
+	struct usb_endpoint_descriptor *itrp_in, *itrp_out;
 	int retval;
-	udev = interface_to_usbdev(intf);
+	//register
 	//초기화
 	//kzalloc으로 0으로 초기화
 	xpad = kzalloc(sizeof(struct usb_xpad), GFP_KERNEL);
@@ -208,64 +209,51 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 		return -ENOMEM;
 
 
+	xpad->udev = usb_get_dev(interface_to_usbdev(intf));
 	//xpad->odata_serial = 0;
-	xpad->udev = udev;
-	xpad->intf = intf;
+	xpad->intf = usb_get_intf(intf);
 	myPad = xpad;
-	//pr_info("xpad is %p, myPad is %p\n", xpad->intf, myPad->intf);
-	//pr_info("interface is %p\n", intf);
-	//devie용 데이터 할당.
-	xpad->data = usb_alloc_coherent(udev, 8, GFP_ATOMIC, &xpad->data_dma);
-	if(!xpad->data)
-		goto error;
+	pr_info("xpad is %p, xpad->udev is %p\n", xpad, xpad->udev);
+	pr_info("interface is %p\n", xpad->intf);
 
-	//if (intf->cur_altsetting->desc.bNumEndpoints != 2)
-	//	return -ENODEV;
-	intf_tmp = intf->cur_altsetting;
-	// find common usb endpoint helper 사용
-	//https://lkml.org/lkml/2020/9/21/1239
+
 	/* set up the endpoint information */
 	/* use only the first bulk-in and bulk-out endpoints */
-	retval = usb_find_common_endpoints(intf_tmp,
-			NULL, NULL, &ep_irq_in, &ep_irq_out);
+	retval = usb_find_common_endpoints(intf->cur_altsetting,NULL,NULL,&itrp_in, &itrp_out);
+
 	if (retval) {
-		dev_err(&intf->dev,
-				"Could not find both irq-in and irq-out endpoints\n");
+		dev_err(&intf->dev,"Could not find both interrupt-in and interrpt-out endpoints\n");
+		pr_err("error %d\n",retval);
 		goto error;
 	}
-	xpad->irq_in_endpointAddr = ep_irq_in->bEndpointAddress;
-	xpad->irq_out_endpointAddr = ep_irq_out->bEndpointAddress;
-	xpad->endpoint_in = ep_irq_in;
-	xpad->endpoint_out = ep_irq_out;
-	xpad->irq_in = usb_alloc_urb(0, GFP_KERNEL);
-	if (!xpad->irq_in) {
-		retval = -ENOMEM;
-		goto err_free_in_urb;
-	}
+	dev_info(&intf->dev,"interrupt in, out found. %p, %p\n",itrp_in, itrp_out);
+
+	//devie용 데이터 할당.
+	//xpad->data = usb_alloc_coherent(udev, 8, GFP_ATOMIC, &xpad->data_dma);
+	//if(!xpad->data)
+	//		goto error;
+
+	//save dev to interface.
 	usb_set_intfdata(intf, xpad);
-	pr_info("[info]: found interrupt end point, in: %d, out: %d", ep_irq_in->bEndpointAddress, ep_irq_out->bEndpointAddress);
-	pr_info("probe \n");
-	//pr_info("%04X:%04X pluged \n", id->idVendor, id->idProduct);
 	retval = usb_register_dev(intf, &xbox_class);
-	if (retval< 0) {
-		pr_err("usb_register failed for the "__FILE__ "driver."
-				"Error number %d", retval);
+	if(retval){
+		dev_err(&intf->dev,
+				"Not able to get a minor for this device.\n");
 		usb_set_intfdata(intf, NULL);
 		goto error;
 	}
-	/* let the user know what node this device is now attached to */
-	dev_info(&intf->dev,
-			"USB Skeleton device now attached to USBSkel-%d",
-			intf->minor);
-	//input으로 등록.
-	xpad_init_input(xpad);
+
+	dev_info(&intf->dev, "usb xbox360 driver was registerd\n");
+
+
+	//register usb device
 
 	return 0;
 error:
 	kfree(xpad);
-	return retval;
 err_free_in_urb:
 	usb_free_urb(xpad->irq_in);
+
 	return retval;
 
 }
@@ -273,10 +261,10 @@ static void xpad_disconnect(struct usb_interface *intf)
 {
 	struct usb_xpad *xpad;
 	xpad = usb_get_intfdata(intf);
-	pr_info("xpad address is %p\n", xpad);
-	xpad_deinit_input(xpad);
-	usb_deregister_dev(intf, &xbox_class);
 	usb_set_intfdata(intf, NULL);
+	pr_info("xpad address is %p, intf is %p\n", xpad, intf);
+	//xpad_deinit_input(xpad);
+	usb_deregister_dev(intf, &xbox_class);
 	kfree(xpad);
 	pr_info("disconnected\n");
 }
@@ -290,19 +278,22 @@ static int xpad_resume(struct usb_interface *intf)
 	pr_info("resumed\n");
 	return 0;
 }
+
+
+//메인 부분.
 static struct usb_driver xpad_test_driver = {
-	.name		= "xbox360_test",
+	.name		= "xbox360",
 	.probe		= xpad_probe,
 	.disconnect	= xpad_disconnect,
 	.suspend	= xpad_suspend,
 	.resume		= xpad_resume,
 	.id_table	= xpad_table,
 };
-// 모듈 loading, unloading 테스트를 위해 과거 방식으로 사용
-//module_init(usb_xboxtest_init);
-//module_exit(usb_xboxtest_exit);
-//Macro
+
 module_usb_driver(xpad_test_driver);
+
+
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("now0930");
 MODULE_DESCRIPTION("Hello, xbox pad!");
