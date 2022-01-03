@@ -66,22 +66,24 @@ resubmit:
 static ssize_t xbox_read(struct file *file, char *buffer, size_t count,
 		loff_t *ppos)
 {
-	pr_info("device was read.\n");
+	pr_info("%s: device was read.\n", __func__);
 	return 0;
 }
 static ssize_t xbox_write(struct file *file, const char *user_buffer,
 		size_t count, loff_t *ppos)
 {
+	pr_info("%s: device was written.\n", __func__);
+
 	return 0;
 }
 static int xbox_open(struct inode *inode, struct file *file)
 {
-	pr_info("xbox was opened\n");
+	pr_info("%s: xbox was opened\n", __func__);
 	return 0;
 }
 static int xbox_release(struct inode *inode, struct file *file)
 {
-	pr_info("xbox was released\n");
+	pr_info("%s: xbox was released\n", __func__);
 	return 0;
 }
 static int xbox_flush(struct file *file, fl_owner_t id)
@@ -102,7 +104,14 @@ static const struct file_operations xbox360_fops = {
  * and to have the device registered with the driver core
  */
 static struct usb_class_driver xbox_class = {
-	.name =		"xbox360 driver%d",
+	///dev에 아래 이름 +숫자로 파일을 만듦.
+	//dev에길이에 제한이 있음
+	/*
+	pi@raspberrypi:/dev $ ls now0930xbox* -l
+	crw------- 1 root root 180, 1 Jan  3 10:01 now0930xbox0
+	crw------- 1 root root 180, 2 Jan  3 10:01 now0930xbox1
+	*/
+	.name =		"now0930xbox%d",
 	.fops =		&xbox360_fops,
 	.minor_base =	USB_XBOX_MINOR_BASE,
 };
