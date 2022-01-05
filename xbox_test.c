@@ -6,7 +6,23 @@
 #include <linux/device.h>
 #include <linux/usb/input.h>
 #include <linux/slab.h>
-#define USB_XBOX_MINOR_BASE	1
+#define USB_XBOX_MINOR_BASE	120
+#define XPAD_PKT_LEN 64
+#define XPAD_OUT_CMD_IDX	0
+#define XPAD_OUT_FF_IDX		1
+#define XPAD_OUT_LED_IDX	(1 + IS_ENABLED(CONFIG_JOYSTICK_XPAD_FF))
+#define XPAD_NUM_OUT_PACKETS	(1 + \
+				 IS_ENABLED(CONFIG_JOYSTICK_XPAD_FF) + \
+				 IS_ENABLED(CONFIG_JOYSTICK_XPAD_LEDS))
+
+
+//led command용 packet
+struct xpad_output_packet {
+	u8 data[XPAD_PKT_LEN];
+	u8 len;
+	bool pending;
+};
+
 //사용할 구조체 선언.
 struct usb_xpad{
 	struct input_dev *dev;		/* input device interface */
@@ -18,15 +34,40 @@ struct usb_xpad{
 	signed char *data;		/* input data */
 	dma_addr_t data_dma;
 	struct urb *irq_in;		/* urb for interrupt in report*/
+	struct urb *irq_out;		/* led controle용 urb*/
 	struct work_struct work;	/* init/remove device from callback */
 	char phys[64];			/* physical device path */
+	struct xpad_led *led;		/* led*/
+
+	struct xpad_output_packet led_command;	/*led command*/
 
 };
+
+#if defined(CONFIG_JOYSTICK_XPAD_LEDS)
+#include <linux/leds.h>
+#include <linux/idr.h>
+
+struct xpad_led {
+	char name[16];
+	struct led_classdev led_cdev;
+	struct usb_xpad *xpad;
+};
+#endif
+
+
 static struct usb_xpad *myPad;
 static int xpad_init_input(struct usb_xpad *xpad);
 static void xpad_deinit_input(struct usb_xpad *xpad);
 static int xpad_open(struct input_dev *dev);
 static void xpad_close(struct input_dev *dev);
+static int init_output(struct usb_xpad *xpad,
+		struct usb_endpoint_descriptor *ep_irq_out);
+
+static int xpad_led_probe(struct usb_xpad *xpad);
+static void xpad_led_disconnect(struct usb_xpad *xpad);
+
+
+
 static void usb_xpad_irq(struct urb *urb){
 	struct input_dev *dev;
 	signed char *data;
@@ -88,6 +129,7 @@ static int xbox_release(struct inode *inode, struct file *file)
 }
 static int xbox_flush(struct file *file, fl_owner_t id)
 {
+	pr_info("%s: xbox was flushed\n", __func__);
 	return 0;
 }
 static const struct file_operations xbox360_fops = {
@@ -230,6 +272,10 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	/* use only the first bulk-in and bulk-out endpoints */
 	retval = usb_find_common_endpoints(intf->cur_altsetting,NULL,NULL,&itrp_in, &itrp_out);
 
+	xpad->endpoint_in = itrp_in;
+	xpad->endpoint_out = itrp_out;
+
+
 	if (retval) {
 		dev_err(&intf->dev,"Could not find both interrupt-in and interrpt-out endpoints\n");
 		pr_err("error %d\n",retval);
@@ -255,7 +301,11 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	dev_info(&intf->dev, "usb xbox360 driver was registerd\n");
 
 
-	//register usb device
+	//led 등록
+
+	retval = xpad_led_probe(xpad);
+	init_output(xpad, itrp_out);
+
 
 	return 0;
 error:
@@ -266,6 +316,89 @@ err_free_in_urb:
 	return retval;
 
 }
+
+static int init_output(struct usb_xpad *xpad,
+		struct usb_endpoint_descriptor *ep_irq_out){
+	int retval;
+	xpad->irq_out = usb_alloc_urb(0, GFP_KERNEL);
+
+	if(!xpad->irq_out){
+		retval = -ENOMEM;
+		goto err_free_coherent;
+	}
+	pr_info("urb was allocated");
+	return 0;
+
+
+err_free_coherent:
+	return 0;
+}
+
+
+static void free_output(struct usb_xpad *xpad)
+{
+	usb_free_urb(xpad->irq_out);
+
+}
+
+
+
+static void xpad_send_led_command(struct usb_xpad *xpad, int command)
+{
+	command %= 16;
+
+
+}
+	
+static void xpad_led_set(struct led_classdev *led_cdev,
+			 enum led_brightness value)
+{
+	struct xpad_led *xpad_led = container_of(led_cdev,
+						 struct xpad_led, led_cdev);
+
+	xpad_send_led_command(xpad_led->xpad, value);
+}
+
+
+
+
+static int xpad_led_probe(struct usb_xpad *xpad)
+{
+	struct xpad_led *led;
+	struct led_classdev *led_cdev;	//임시 변수
+	int retval;
+	led = kzalloc(sizeof(struct xpad_led), GFP_KERNEL);
+	//xpad로 접근하기 쉽게 기록
+	xpad->led = led;
+	snprintf(led->name, sizeof(led->name),"xpad_led");
+
+	led_cdev = &led->led_cdev;
+	led_cdev->name = led->name;
+	led_cdev->brightness_set = xpad_led_set;
+	retval = led_classdev_register(&xpad->udev->dev, led_cdev);
+	if (retval)
+		goto err_free;
+
+	return 0;
+
+err_free:
+	return retval;
+}
+
+
+static void xpad_led_disconnect(struct usb_xpad *xpad){
+	struct xpad_led *xpad_led = xpad->led;
+	if(xpad->led){
+		led_classdev_unregister(&xpad_led->led_cdev);
+		kfree(xpad_led);
+
+	}
+
+
+
+}
+
+
 static void xpad_disconnect(struct usb_interface *intf)
 {
 	struct usb_xpad *xpad;
@@ -274,8 +407,11 @@ static void xpad_disconnect(struct usb_interface *intf)
 	pr_info("xpad address is %p, intf is %p\n", xpad, intf);
 	//xpad_deinit_input(xpad);
 	usb_deregister_dev(intf, &xbox_class);
+	free_output(xpad);
 	kfree(xpad);
+	xpad_led_disconnect(xpad);
 	pr_info("disconnected\n");
+
 }
 static int xpad_suspend(struct usb_interface *intf, pm_message_t message)
 {
