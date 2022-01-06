@@ -345,7 +345,14 @@ static void free_output(struct usb_xpad *xpad)
 
 static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 {
+	int retval;
 	command %= 16;
+	retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+	pr_info("usb submitted\n");
+	if (retval){
+		dev_err(&xpad->intf->dev,"%s - usb_submit_urb failed with %d\n",
+				__func__, retval);
+	}
 
 
 }
@@ -372,6 +379,8 @@ static int xpad_led_probe(struct usb_xpad *xpad)
 	xpad->led = led;
 	snprintf(led->name, sizeof(led->name),"xpad_led");
 
+	led->xpad = xpad;
+
 	led_cdev = &led->led_cdev;
 	led_cdev->name = led->name;
 	led_cdev->brightness_set = xpad_led_set;
@@ -388,9 +397,10 @@ err_free:
 
 static void xpad_led_disconnect(struct usb_xpad *xpad){
 	struct xpad_led *xpad_led = xpad->led;
-	if(xpad->led){
+	if(xpad_led){
 		led_classdev_unregister(&xpad_led->led_cdev);
 		kfree(xpad_led);
+		pr_info("xpad led was unregistered\n");
 
 	}
 
@@ -407,9 +417,9 @@ static void xpad_disconnect(struct usb_interface *intf)
 	pr_info("xpad address is %p, intf is %p\n", xpad, intf);
 	//xpad_deinit_input(xpad);
 	usb_deregister_dev(intf, &xbox_class);
+	xpad_led_disconnect(xpad);
 	free_output(xpad);
 	kfree(xpad);
-	xpad_led_disconnect(xpad);
 	pr_info("disconnected\n");
 
 }
