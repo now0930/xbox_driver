@@ -6,6 +6,7 @@
 #include <linux/device.h>
 #include <linux/usb/input.h>
 #include <linux/slab.h>
+
 #define USB_XBOX_MINOR_BASE	120
 #define XPAD_PKT_LEN 64
 #define XPAD_OUT_CMD_IDX	0
@@ -32,7 +33,8 @@ struct usb_xpad{
 	__u8    irq_out_endpointAddr;   /* interrupt out address*/
 	struct usb_endpoint_descriptor *endpoint_in, *endpoint_out;
 	signed char *data;		/* input data */
-	dma_addr_t data_dma;
+	unsigned char *odata;		/* output data */
+	dma_addr_t odata_dma;
 	struct urb *irq_in;		/* urb for interrupt in report*/
 	struct urb *irq_out;		/* led controle용 urb*/
 	struct work_struct work;	/* init/remove device from callback */
@@ -170,55 +172,7 @@ static const signed short xpad_common_btn[] = {
 	-1						/* terminating entry */
 };
 MODULE_DEVICE_TABLE(usb, xpad_table);
-static int xpad_init_input(struct usb_xpad *xpad)
-{
-	struct input_dev *input_dev;
-	int i, error;
-	int pipe, maxp;
-	input_dev = input_allocate_device();
-	if (!input_dev)
-		return -ENOMEM;
-	xpad->dev = input_dev;
-	input_dev->name  = "xbox360";
 
-
-	set_bit(EV_KEY, input_dev->evbit);
-	set_bit(BTN_A, input_dev->keybit);
-
-
-	usb_make_path(xpad->udev, xpad->phys, sizeof(xpad->phys));
-	strlcat(xpad->phys, "/input0", sizeof(xpad->phys));
-	usb_to_input_id(xpad->udev, &input_dev->id);
-	input_dev->dev.parent = &xpad->intf->dev;
-
-	/* set up standard buttons */
-	for (i = 0; xpad_common_btn[i] >= 0; i++)
-		input_set_capability(input_dev, EV_KEY, xpad_common_btn[i]);
-
-	input_set_drvdata(input_dev, xpad);
-	pr_info("chech here\n");
-
-	input_dev->open = xpad_open;
-	input_dev->close = xpad_close;
-
-	pipe = usb_rcvintpipe(xpad->udev, xpad->irq_in_endpointAddr);
-	maxp = usb_maxpacket(xpad->udev, pipe, usb_pipeout(pipe));
-	usb_fill_int_urb(xpad->irq_in, xpad->udev,
-			pipe, xpad->data,
-			(maxp > 8 ? 8 : maxp),
-			usb_xpad_irq, xpad, 
-			xpad->endpoint_in->bInterval);
-	xpad->irq_in->transfer_dma = xpad->data_dma;
-	xpad->irq_in->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-	error = input_register_device(input_dev);
-	if (error)
-		goto err_free_dev;
-	pr_info("usb input was registered\n");
-	return 0;	//return ok;
-err_free_dev:
-	input_free_device(input_dev);
-	return error;
-}
 static void xpad_deinit_input(struct usb_xpad *xpad)
 {
 	pr_info("xpad is %p, ->dev is %p.\n",xpad, xpad->dev);
@@ -283,10 +237,6 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	}
 	dev_info(&intf->dev,"interrupt in, out found. %p, %p\n",itrp_in, itrp_out);
 
-	//devie용 데이터 할당.
-	//xpad->data = usb_alloc_coherent(udev, 8, GFP_ATOMIC, &xpad->data_dma);
-	//if(!xpad->data)
-	//		goto error;
 
 	//save dev to interface.
 	usb_set_intfdata(intf, xpad);
@@ -302,24 +252,22 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 
 
 	//led 등록
-
 	retval = xpad_led_probe(xpad);
 	init_output(xpad, itrp_out);
-
-
 	return 0;
 error:
 	kfree(xpad);
-err_free_in_urb:
-	usb_free_urb(xpad->irq_in);
-
 	return retval;
 
 }
 
 static int init_output(struct usb_xpad *xpad,
 		struct usb_endpoint_descriptor *ep_irq_out){
-	int retval;
+	//http://www.makelinux.net/ldd3/chp-13-sect-3.shtml
+	int retval, pipe;
+
+	xpad->odata = usb_alloc_coherent(xpad->udev, XPAD_PKT_LEN, GFP_KERNEL, &xpad->odata_dma); 
+	pr_info("dma output address %p with size %d was allocated\n", &xpad->odata_dma, XPAD_PKT_LEN);
 	xpad->irq_out = usb_alloc_urb(0, GFP_KERNEL);
 
 	if(!xpad->irq_out){
@@ -327,17 +275,27 @@ static int init_output(struct usb_xpad *xpad,
 		goto err_free_coherent;
 	}
 	pr_info("urb was allocated");
+
+
+	//urb settup
+	pipe = usb_sndintpipe(xpad->udev, xpad->endpoint_out->bEndpointAddress);
+
 	return 0;
 
 
 err_free_coherent:
-	return 0;
+	usb_free_coherent(xpad->udev, XPAD_PKT_LEN, xpad->odata, xpad->odata_dma);
+
+	return retval;
 }
 
 
 static void free_output(struct usb_xpad *xpad)
 {
 	usb_free_urb(xpad->irq_out);
+	pr_info("dma output address %p with size %d was freed\n", &xpad->odata_dma, XPAD_PKT_LEN);
+	usb_free_coherent(xpad->udev, XPAD_PKT_LEN, xpad->odata, xpad->odata_dma);
+
 
 }
 
@@ -350,8 +308,10 @@ static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 	retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
 	pr_info("usb submitted\n");
 	if (retval){
-		dev_err(&xpad->intf->dev,"%s - usb_submit_urb failed with %d\n",
-				__func__, retval);
+		//https://stackoverflow.com/questions/10006071/is-there-an-equvalent-for-perror-in-the-kernel
+		dev_err(&xpad->intf->dev,"%s - usb_submit_urb failed with %pe\n",
+				__func__, ERR_PTR(retval));
+		pr_err("error %d\n",retval);
 	}
 
 
