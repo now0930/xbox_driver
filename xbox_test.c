@@ -32,6 +32,7 @@ struct usb_xpad{
 	__u8    irq_in_endpointAddr;    /* interrupt in address*/
 	__u8    irq_out_endpointAddr;   /* interrupt out address*/
 	struct usb_endpoint_descriptor *endpoint_in, *endpoint_out;
+
 	signed char *data;		/* input data */
 	unsigned char *odata;		/* output data */
 	dma_addr_t odata_dma;
@@ -41,6 +42,7 @@ struct usb_xpad{
 	char phys[64];			/* physical device path */
 	struct xpad_led *led;		/* led*/
 	struct xpad_output_packet led_command[XPAD_NUM_OUT_PACKETS];	/*led command*/
+	spinlock_t odata_lock;
 
 };
 
@@ -67,7 +69,19 @@ static void xpad_led_disconnect(struct usb_xpad *xpad);
 static void xpad_irq_outfn(struct urb *urb);
 
 static void xpad_irq_outfn(struct urb *urb){
-	pr_info("submit completed, xpad_irq_outfn executed\n");
+	struct usb_xpad *xpad = urb->context;
+	struct device *dev = &xpad->intf->dev;
+	int status = urb->status;
+	int error;
+	unsigned long flags;
+
+
+	spin_lock_irqsave(&xpad->odata_lock, flags);
+	error = usb_submit_urb(urb, GFP_ATOMIC);
+	pr_info("%s: submit completed\n",__func__);
+
+
+	spin_unlock_irqrestore(&xpad->odata_lock, flags);
 }
 
 
@@ -213,6 +227,7 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	xpad->endpoint_out = itrp_out;
 
 
+
 	if (retval) {
 		dev_err(&intf->dev,"Could not find both interrupt-in and interrpt-out endpoints\n");
 		pr_err("error %d\n",retval);
@@ -263,37 +278,21 @@ static int init_output(struct usb_xpad *xpad,
 
 	//urb settup
 	pipe = usb_sndintpipe(xpad->udev, xpad->endpoint_out->bEndpointAddress);
+	pr_info("xpad->endpoint_out->bInterval is %d\n", xpad->endpoint_out->bInterval);
 
 	usb_fill_int_urb(xpad->irq_out, xpad->udev, pipe,
 			xpad->odata, XPAD_PKT_LEN,
 			xpad_irq_outfn, xpad, xpad->endpoint_out->bInterval);
 
-//여기서부터 임시..
-	struct xpad_output_packet *packet;
-	packet = &xpad->led_command[XPAD_OUT_LED_IDX];
-	unsigned long flags;
-	int command;
-	command = 1;
-	command %= 16;
-	packet->data[0] = 0x01;
-	packet->data[1] = 0x03;
-	packet->data[2] = command;
-	packet->len = 3;
-	packet->pending = true;
 
-	pr_info("check data 0 %d\n", xpad->led_command[2].data[0]);
-	pr_info("check data 1 %d\n", xpad->led_command[2].data[1]);
-	pr_info("check data 2 %d\n", xpad->led_command[2].data[2]);
-	pr_info("check data len %d\n", xpad->led_command[2].len);
-
-//여기까지
 	retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
 	if (retval)
 		dev_err(&xpad->intf->dev, "%s - usb_submit_urb failed with result %d\n",
 				__func__, retval);
 	else
-		pr_info("usb submit urb completed %s\n", __func__);
-
+		pr_info("%s: usb submit urb completed.\n", __func__);
+	pr_info("XPAD_OUT_LED_IDX: %d",XPAD_OUT_LED_IDX);
+	pr_info("XPAD_NUM_OUT_PACKETS: %d",XPAD_NUM_OUT_PACKETS);
 
 	return 0;
 
@@ -322,9 +321,7 @@ static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 	struct xpad_output_packet *packet;
 	packet = &xpad->led_command[XPAD_OUT_LED_IDX];
 	unsigned long flags;
-	//command %= 16;
-	command = 7;
-
+	command %= 16;
 
 	packet->data[0] = 0x01;
 	packet->data[1] = 0x03;
@@ -333,14 +330,23 @@ static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 	packet->pending = true;
 
 
+	//check
+	pr_info("xpad->led_command->data[0]:%d,[1]:%d,[2]:%d, with %d len\n",
+			xpad->led_command[XPAD_OUT_LED_IDX].data[0],
+			xpad->led_command[XPAD_OUT_LED_IDX].data[1],
+			xpad->led_command[XPAD_OUT_LED_IDX].data[2],
+			xpad->led_command[XPAD_OUT_LED_IDX].len);
+
+	spin_lock_irqsave(&xpad->odata_lock, flags);
 	retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
-	pr_info("led command urb submitted\n");
+	spin_unlock_irqrestore(&xpad->odata_lock, flags);
 	if (retval){
 		//https://stackoverflow.com/questions/10006071/is-there-an-equvalent-for-perror-in-the-kernel
 		dev_err(&xpad->intf->dev,"%s - usb_submit_urb failed with %pe\n",
 				__func__, ERR_PTR(retval));
-		pr_err("error %d\n",retval);
 	}
+	else
+		pr_info("%s: completed\n",__func__);
 
 
 }
@@ -372,6 +378,8 @@ static int xpad_led_probe(struct usb_xpad *xpad)
 	led_cdev = &led->led_cdev;
 	led_cdev->name = led->name;
 	led_cdev->brightness_set = xpad_led_set;
+	led_cdev->flags = LED_CORE_SUSPENDRESUME;
+
 	retval = led_classdev_register(&xpad->udev->dev, led_cdev);
 	if (retval)
 		goto err_free;
