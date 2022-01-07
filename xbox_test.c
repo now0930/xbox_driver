@@ -40,8 +40,7 @@ struct usb_xpad{
 	struct work_struct work;	/* init/remove device from callback */
 	char phys[64];			/* physical device path */
 	struct xpad_led *led;		/* led*/
-
-	struct xpad_output_packet led_command;	/*led command*/
+	struct xpad_output_packet led_command[XPAD_NUM_OUT_PACKETS];	/*led command*/
 
 };
 
@@ -60,14 +59,16 @@ struct xpad_led {
 static struct usb_xpad *myPad;
 static int xpad_init_input(struct usb_xpad *xpad);
 static void xpad_deinit_input(struct usb_xpad *xpad);
-static int xpad_open(struct input_dev *dev);
-static void xpad_close(struct input_dev *dev);
 static int init_output(struct usb_xpad *xpad,
 		struct usb_endpoint_descriptor *ep_irq_out);
 
 static int xpad_led_probe(struct usb_xpad *xpad);
 static void xpad_led_disconnect(struct usb_xpad *xpad);
+static void xpad_irq_outfn(struct urb *urb);
 
+static void xpad_irq_outfn(struct urb *urb){
+	pr_info("submit completed, xpad_irq_outfn executed\n");
+}
 
 
 static void usb_xpad_irq(struct urb *urb){
@@ -180,24 +181,6 @@ static void xpad_deinit_input(struct usb_xpad *xpad)
 		input_unregister_device(xpad->dev);
 }
 
-static int xpad_open(struct input_dev *dev)
-{
-	struct usb_xpad *xpad = input_get_drvdata(dev);
-	if (usb_submit_urb(xpad->irq_in, GFP_KERNEL))
-		return -EIO;
-	pr_info("device was opened\n");
-	return 0;
-
-}
-
-static void xpad_close(struct input_dev *dev)
-{
-	struct usb_xpad *xpad = input_get_drvdata(dev);
-	usb_kill_urb(xpad->irq_in);
-	pr_info("device was closed\n");
-
-}
-
 static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_xpad *xpad;
@@ -267,7 +250,8 @@ static int init_output(struct usb_xpad *xpad,
 	int retval, pipe;
 
 	xpad->odata = usb_alloc_coherent(xpad->udev, XPAD_PKT_LEN, GFP_KERNEL, &xpad->odata_dma); 
-	pr_info("dma output address %p with size %d was allocated\n", &xpad->odata_dma, XPAD_PKT_LEN);
+	pr_info("dma output address %p with size %d, point to %p was allocated\n", &xpad->odata_dma, XPAD_PKT_LEN, xpad->odata);
+	pr_info("actual address is %p\n",&xpad->odata_dma);
 	xpad->irq_out = usb_alloc_urb(0, GFP_KERNEL);
 
 	if(!xpad->irq_out){
@@ -279,6 +263,37 @@ static int init_output(struct usb_xpad *xpad,
 
 	//urb settup
 	pipe = usb_sndintpipe(xpad->udev, xpad->endpoint_out->bEndpointAddress);
+
+	usb_fill_int_urb(xpad->irq_out, xpad->udev, pipe,
+			xpad->odata, XPAD_PKT_LEN,
+			xpad_irq_outfn, xpad, xpad->endpoint_out->bInterval);
+
+//여기서부터 임시..
+	struct xpad_output_packet *packet;
+	packet = &xpad->led_command[XPAD_OUT_LED_IDX];
+	unsigned long flags;
+	int command;
+	command = 1;
+	command %= 16;
+	packet->data[0] = 0x01;
+	packet->data[1] = 0x03;
+	packet->data[2] = command;
+	packet->len = 3;
+	packet->pending = true;
+
+	pr_info("check data 0 %d\n", xpad->led_command[2].data[0]);
+	pr_info("check data 1 %d\n", xpad->led_command[2].data[1]);
+	pr_info("check data 2 %d\n", xpad->led_command[2].data[2]);
+	pr_info("check data len %d\n", xpad->led_command[2].len);
+
+//여기까지
+	retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+	if (retval)
+		dev_err(&xpad->intf->dev, "%s - usb_submit_urb failed with result %d\n",
+				__func__, retval);
+	else
+		pr_info("usb submit urb completed %s\n", __func__);
+
 
 	return 0;
 
@@ -304,9 +319,22 @@ static void free_output(struct usb_xpad *xpad)
 static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 {
 	int retval;
-	command %= 16;
+	struct xpad_output_packet *packet;
+	packet = &xpad->led_command[XPAD_OUT_LED_IDX];
+	unsigned long flags;
+	//command %= 16;
+	command = 7;
+
+
+	packet->data[0] = 0x01;
+	packet->data[1] = 0x03;
+	packet->data[2] = command;
+	packet->len = 3;
+	packet->pending = true;
+
+
 	retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
-	pr_info("usb submitted\n");
+	pr_info("led command urb submitted\n");
 	if (retval){
 		//https://stackoverflow.com/questions/10006071/is-there-an-equvalent-for-perror-in-the-kernel
 		dev_err(&xpad->intf->dev,"%s - usb_submit_urb failed with %pe\n",
