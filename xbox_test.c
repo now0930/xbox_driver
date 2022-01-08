@@ -38,6 +38,7 @@ struct usb_xpad{
 	dma_addr_t odata_dma;
 	struct urb *irq_in;		/* urb for interrupt in report*/
 	struct urb *irq_out;		/* led controle용 urb*/
+	struct usb_anchor irq_out_anchor;
 	struct work_struct work;	/* init/remove device from callback */
 	char phys[64];			/* physical device path */
 	struct xpad_led *led;		/* led*/
@@ -203,6 +204,11 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	//struct usb_host_interface *intf_tmp;
 	struct usb_endpoint_descriptor *itrp_in, *itrp_out;
 	int retval;
+
+	//한개만 등록..
+	if (intf->cur_altsetting->desc.bNumEndpoints != 2)
+		return -ENODEV;
+
 	//register
 	//초기화
 	//kzalloc으로 0으로 초기화
@@ -210,23 +216,22 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	if (!xpad)
 		return -ENOMEM;
 
-
 	xpad->udev = usb_get_dev(interface_to_usbdev(intf));
 	//xpad->odata_serial = 0;
 	xpad->intf = usb_get_intf(intf);
 	myPad = xpad;
 	pr_info("xpad is %p, xpad->udev is %p\n", xpad, xpad->udev);
 	pr_info("interface is %p\n", xpad->intf);
-
+	pr_info("cur_altsetting is %d\n",intf->cur_altsetting->desc.bNumEndpoints);
+	
 
 	/* set up the endpoint information */
 	/* use only the first bulk-in and bulk-out endpoints */
-	retval = usb_find_common_endpoints(intf->cur_altsetting,NULL,NULL,&itrp_in, &itrp_out);
+	//retval = usb_find_common_endpoints(intf->cur_altsetting,NULL,NULL,&itrp_in, &itrp_out);
+	retval = usb_find_last_int_out_endpoint(intf->cur_altsetting,&itrp_out);
 
 	xpad->endpoint_in = itrp_in;
 	xpad->endpoint_out = itrp_out;
-
-
 
 	if (retval) {
 		dev_err(&intf->dev,"Could not find both interrupt-in and interrpt-out endpoints\n");
@@ -256,6 +261,8 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 error:
 	kfree(xpad);
 	return retval;
+pass_register:
+	return retval;
 
 }
 
@@ -283,12 +290,10 @@ static int init_output(struct usb_xpad *xpad,
 	usb_fill_int_urb(xpad->irq_out, xpad->udev, pipe,
 			xpad->odata, XPAD_PKT_LEN,
 			xpad_irq_outfn, xpad, xpad->endpoint_out->bInterval);
-
-
+	
 	retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
 	if (retval)
-		dev_err(&xpad->intf->dev, "%s - usb_submit_urb failed with result %d\n",
-				__func__, retval);
+		dev_err(&xpad->intf->dev, "%s - usb_submit_urb failed with result %pe\n",__func__, ERR_PTR(retval));
 	else
 		pr_info("%s: usb submit urb completed.\n", __func__);
 	pr_info("XPAD_OUT_LED_IDX: %d",XPAD_OUT_LED_IDX);
@@ -384,6 +389,7 @@ static int xpad_led_probe(struct usb_xpad *xpad)
 	if (retval)
 		goto err_free;
 
+	led_set_brightness(&xpad->led->led_cdev, 10);
 	return 0;
 
 err_free:
