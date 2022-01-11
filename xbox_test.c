@@ -44,6 +44,7 @@ struct usb_xpad{
 	struct xpad_led *led;		/* led*/
 	struct xpad_output_packet led_command[XPAD_NUM_OUT_PACKETS];	/*led command*/
 	spinlock_t odata_lock;
+	bool irq_out_active;            /* we must not use an active URB */
 
 };
 
@@ -78,10 +79,8 @@ static void xpad_irq_outfn(struct urb *urb){
 
 
 	spin_lock_irqsave(&xpad->odata_lock, flags);
-	error = usb_submit_urb(urb, GFP_ATOMIC);
-	pr_info("%s: submit completed\n",__func__);
-
-
+	//error = usb_submit_urb(urb, GFP_ATOMIC);
+	//pr_info("%s: submit completed\n",__func__);
 	spin_unlock_irqrestore(&xpad->odata_lock, flags);
 }
 
@@ -205,9 +204,10 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	struct usb_endpoint_descriptor *itrp_in, *itrp_out;
 	int retval;
 
-	//한개만 등록..
+	//endpoint 2번 한개만 등록..
+	//여기 없으면 인터록으로 설정 가능한 2개 device를 등록함.
 	if (intf->cur_altsetting->desc.bNumEndpoints != 2)
-		return -ENODEV;
+		goto skip_altsetting;
 
 	//register
 	//초기화
@@ -255,14 +255,14 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 
 
 	//led 등록
-	retval = xpad_led_probe(xpad);
 	init_output(xpad, itrp_out);
+	retval = xpad_led_probe(xpad);
 	return 0;
 error:
 	kfree(xpad);
 	return retval;
-pass_register:
-	return retval;
+skip_altsetting:
+	return -ENODEV;
 
 }
 
@@ -274,6 +274,8 @@ static int init_output(struct usb_xpad *xpad,
 	xpad->odata = usb_alloc_coherent(xpad->udev, XPAD_PKT_LEN, GFP_KERNEL, &xpad->odata_dma); 
 	pr_info("dma output address %p with size %d, point to %p was allocated\n", &xpad->odata_dma, XPAD_PKT_LEN, xpad->odata);
 	pr_info("actual address is %p\n",&xpad->odata_dma);
+
+	init_usb_anchor(&xpad->irq_out_anchor);
 	xpad->irq_out = usb_alloc_urb(0, GFP_KERNEL);
 
 	if(!xpad->irq_out){
@@ -290,12 +292,18 @@ static int init_output(struct usb_xpad *xpad,
 	usb_fill_int_urb(xpad->irq_out, xpad->udev, pipe,
 			xpad->odata, XPAD_PKT_LEN,
 			xpad_irq_outfn, xpad, xpad->endpoint_out->bInterval);
-	
-	retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
-	if (retval)
-		dev_err(&xpad->intf->dev, "%s - usb_submit_urb failed with result %pe\n",__func__, ERR_PTR(retval));
-	else
-		pr_info("%s: usb submit urb completed.\n", __func__);
+	xpad->irq_out->transfer_dma = xpad->odata_dma;
+	xpad->irq_out->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+
+	//retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+	//if (retval){
+//		dev_err(&xpad->intf->dev, "%s - usb_submit_urb failed with result %pe\n",__func__, ERR_PTR(retval));
+//		usb_unanchor_urb(xpad->irq_out);
+//		
+//	}
+//	else
+//		pr_info("%s: usb submit urb completed.\n", __func__);
+		
 	pr_info("XPAD_OUT_LED_IDX: %d",XPAD_OUT_LED_IDX);
 	pr_info("XPAD_NUM_OUT_PACKETS: %d",XPAD_NUM_OUT_PACKETS);
 
@@ -328,11 +336,21 @@ static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 	unsigned long flags;
 	command %= 16;
 
+	
+	spin_lock_irqsave(&xpad->odata_lock, flags);
 	packet->data[0] = 0x01;
 	packet->data[1] = 0x03;
 	packet->data[2] = command;
 	packet->len = 3;
 	packet->pending = true;
+
+
+	//urb로 전달.
+	//urb 구조로 직접 전달 해야 함..
+
+	memcpy(xpad->odata, packet->data, packet->len);
+	xpad->irq_out->transfer_buffer_length = packet->len;
+
 
 
 	//check
@@ -342,13 +360,15 @@ static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 			xpad->led_command[XPAD_OUT_LED_IDX].data[2],
 			xpad->led_command[XPAD_OUT_LED_IDX].len);
 
-	spin_lock_irqsave(&xpad->odata_lock, flags);
+	usb_anchor_urb(xpad->irq_out, &xpad->irq_out_anchor);
 	retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
 	spin_unlock_irqrestore(&xpad->odata_lock, flags);
 	if (retval){
 		//https://stackoverflow.com/questions/10006071/is-there-an-equvalent-for-perror-in-the-kernel
 		dev_err(&xpad->intf->dev,"%s - usb_submit_urb failed with %pe\n",
 				__func__, ERR_PTR(retval));
+		usb_unanchor_urb(xpad->irq_out);
+		xpad->irq_out_active = false;
 	}
 	else
 		pr_info("%s: completed\n",__func__);
