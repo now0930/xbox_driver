@@ -48,6 +48,7 @@ struct usb_xpad{
 	spinlock_t odata_lock;
 	bool irq_out_active;            /* we must not use an active URB */
 	int pad_nr;			// order
+	int last_out_packet;
 
 };
 
@@ -72,6 +73,8 @@ static int init_output(struct usb_xpad *xpad,
 static int xpad_led_probe(struct usb_xpad *xpad);
 static void xpad_led_disconnect(struct usb_xpad *xpad);
 static void xpad_irq_outfn(struct urb *urb);
+static bool xpad_prepare_next_out_packet(struct usb_xpad *xpad);
+
 
 static void xpad_irq_outfn(struct urb *urb){
 	struct usb_xpad *xpad = urb->context;
@@ -80,13 +83,41 @@ static void xpad_irq_outfn(struct urb *urb){
 	int error;
 	unsigned long flags;
 
-
 	spin_lock_irqsave(&xpad->odata_lock, flags);
-	//error = usb_submit_urb(urb, GFP_ATOMIC);
-	//무제한으로 실행하지 않도록 방지
-	xpad->irq_out_active = false;
-	pr_info("%s: submit completed\n",__func__);
+	switch (status){
+		case 0:
+			/* success */
+			pr_info("%s: submit completed\n",__func__);
+			//무제한으로 실행하지 않도록 방지
+			xpad->irq_out_active = xpad_prepare_next_out_packet(xpad);
+			break;
+		case -ECONNRESET:
+		case -ENOENT:
+		case -ESHUTDOWN:
+			/* this urb is terminated, clean up */
+			dev_dbg(dev, "%s - urb shutting down with status: %d\n",
+					__func__, status);
+			xpad->irq_out_active = false;
+			break;
+
+		default:
+			dev_dbg(dev, "%s - nonzero urb status received: %d\n",
+					__func__, status);
+			break;
+	}
+	if (xpad->irq_out_active) {
+		usb_anchor_urb(urb, &xpad->irq_out_anchor);
+		error = usb_submit_urb(urb, GFP_ATOMIC);
+		if (error) {
+			dev_err(dev,
+					"%s - usb_submit_urb failed with result %d\n",
+					__func__, error);
+			usb_unanchor_urb(urb);
+			xpad->irq_out_active = false;
+		}
+	}
 	spin_unlock_irqrestore(&xpad->odata_lock, flags);
+
 }
 
 
@@ -326,6 +357,61 @@ static void free_output(struct usb_xpad *xpad)
 
 }
 
+/* Callers must hold xpad->odata_lock spinlock */
+static bool xpad_prepare_next_out_packet(struct usb_xpad *xpad)
+{
+	struct xpad_output_packet *pkt, *packet = NULL;
+	int i;
+
+	for (i = 0; i < XPAD_NUM_OUT_PACKETS; i++) {
+		if (++xpad->last_out_packet >= XPAD_NUM_OUT_PACKETS)
+			xpad->last_out_packet = 0;
+
+		pkt = &xpad->led_command[xpad->last_out_packet];
+		if (pkt->pending) {
+			dev_dbg(&xpad->intf->dev,
+					"%s - found pending output packet %d\n",
+					__func__, xpad->last_out_packet);
+			packet = pkt;
+			break;
+		}
+	}
+
+	if (packet) {
+		memcpy(xpad->odata, packet->data, packet->len);
+		xpad->irq_out->transfer_buffer_length = packet->len;
+		packet->pending = false;
+		return true;
+	}
+
+	return false;
+}
+
+
+
+
+static int xpad_try_sending_next_output(struct usb_xpad *xpad)
+{
+	int retval;
+	if (!xpad->irq_out_active && xpad_prepare_next_out_packet(xpad)){
+		usb_anchor_urb(xpad->irq_out, &xpad->irq_out_anchor);
+		retval= usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+		if (retval) {
+			//https://stackoverflow.com/questions/10006071/is-there-an-equvalent-for-perror-in-the-kernel
+			dev_err(&xpad->intf->dev,"%s - usb_submit_urb failed with %pe\n",
+					__func__, ERR_PTR(retval));
+
+			usb_unanchor_urb(xpad->irq_out);
+			return -EIO;
+		}
+		else
+			pr_info("%s: completed\n",__func__);
+		xpad->irq_out_active = true;
+	}
+
+	return 0;
+}
+
 
 
 static void xpad_send_led_command(struct usb_xpad *xpad, int command)
@@ -336,54 +422,23 @@ static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 	unsigned long flags;
 	command %= 16;
 
-	
+
 	spin_lock_irqsave(&xpad->odata_lock, flags);
 	packet->data[0] = 0x01;
 	packet->data[1] = 0x03;
 	packet->data[2] = command;
 	packet->len = 3;
 	packet->pending = true;
-
-	xpad->irq_out_active = true;
-
-
-	//urb로 전달.
-	//urb 구조로 직접 전달 해야 함..
-
-	memcpy(xpad->odata, packet->data, packet->len);
-	xpad->irq_out->transfer_buffer_length = packet->len;
-
-	//check
-	//pr_info("xpad->led_command->data[0]:%d,[1]:%d,[2]:%d, with %d len\n",
-	//		xpad->led_command[XPAD_OUT_LED_IDX].data[0],
-	//		xpad->led_command[XPAD_OUT_LED_IDX].data[1],
-	//		xpad->led_command[XPAD_OUT_LED_IDX].data[2],
-	//		xpad->led_command[XPAD_OUT_LED_IDX].len);
-
-	usb_anchor_urb(xpad->irq_out, &xpad->irq_out_anchor);
-	if(xpad->irq_out_active){
-		retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
-		xpad->irq_out_active = false;
-	}
+	xpad_try_sending_next_output(xpad);
 	spin_unlock_irqrestore(&xpad->odata_lock, flags);
-	if (retval){
-		//https://stackoverflow.com/questions/10006071/is-there-an-equvalent-for-perror-in-the-kernel
-		dev_err(&xpad->intf->dev,"%s - usb_submit_urb failed with %pe\n",
-				__func__, ERR_PTR(retval));
-		usb_unanchor_urb(xpad->irq_out);
-		xpad->irq_out_active = false;
-	}
-	else
-		pr_info("%s: completed\n",__func__);
-
 
 }
-	
+
 static void xpad_led_set(struct led_classdev *led_cdev,
-			 enum led_brightness value)
+		enum led_brightness value)
 {
 	struct xpad_led *xpad_led = container_of(led_cdev,
-						 struct xpad_led, led_cdev);
+			struct xpad_led, led_cdev);
 
 	xpad_send_led_command(xpad_led->xpad, value);
 }
@@ -451,6 +506,7 @@ static void xpad_led_disconnect(struct usb_xpad *xpad){
 	struct xpad_led *xpad_led = xpad->led;
 	if(xpad_led){
 		led_classdev_unregister(&xpad_led->led_cdev);
+		ida_simple_remove(&xpad_pad_seq, xpad->pad_nr);
 		kfree(xpad_led);
 		pr_info("xpad led was unregistered\n");
 
@@ -463,7 +519,7 @@ static void xpad_disconnect(struct usb_interface *intf)
 {
 	struct usb_xpad *xpad;
 	xpad = usb_get_intfdata(intf);
-	pr_info("xpad address is %p, intf is %p\n", xpad, intf);
+	//pr_info("xpad address is %p, intf is %p\n", xpad, intf);
 	//xpad_deinit_input(xpad);
 	xpad_stop_output(xpad);
 	xpad_led_disconnect(xpad);
