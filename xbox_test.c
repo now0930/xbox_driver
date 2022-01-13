@@ -17,6 +17,8 @@
 				 IS_ENABLED(CONFIG_JOYSTICK_XPAD_LEDS))
 
 
+static DEFINE_IDA(xpad_pad_seq);
+
 //led command용 packet
 struct xpad_output_packet {
 	u8 data[XPAD_PKT_LEN];
@@ -45,6 +47,7 @@ struct usb_xpad{
 	struct xpad_output_packet led_command[XPAD_NUM_OUT_PACKETS];	/*led command*/
 	spinlock_t odata_lock;
 	bool irq_out_active;            /* we must not use an active URB */
+	int pad_nr;			// order
 
 };
 
@@ -80,7 +83,9 @@ static void xpad_irq_outfn(struct urb *urb){
 
 	spin_lock_irqsave(&xpad->odata_lock, flags);
 	//error = usb_submit_urb(urb, GFP_ATOMIC);
-	//pr_info("%s: submit completed\n",__func__);
+	//무제한으로 실행하지 않도록 방지
+	xpad->irq_out_active = false;
+	pr_info("%s: submit completed\n",__func__);
 	spin_unlock_irqrestore(&xpad->odata_lock, flags);
 }
 
@@ -257,12 +262,15 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	//led 등록
 	init_output(xpad, itrp_out);
 	retval = xpad_led_probe(xpad);
+
 	return 0;
 error:
 	kfree(xpad);
 	return retval;
 skip_altsetting:
 	return -ENODEV;
+
+
 
 }
 
@@ -295,14 +303,6 @@ static int init_output(struct usb_xpad *xpad,
 	xpad->irq_out->transfer_dma = xpad->odata_dma;
 	xpad->irq_out->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-	//retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
-	//if (retval){
-//		dev_err(&xpad->intf->dev, "%s - usb_submit_urb failed with result %pe\n",__func__, ERR_PTR(retval));
-//		usb_unanchor_urb(xpad->irq_out);
-//		
-//	}
-//	else
-//		pr_info("%s: usb submit urb completed.\n", __func__);
 		
 	pr_info("XPAD_OUT_LED_IDX: %d",XPAD_OUT_LED_IDX);
 	pr_info("XPAD_NUM_OUT_PACKETS: %d",XPAD_NUM_OUT_PACKETS);
@@ -344,6 +344,8 @@ static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 	packet->len = 3;
 	packet->pending = true;
 
+	xpad->irq_out_active = true;
+
 
 	//urb로 전달.
 	//urb 구조로 직접 전달 해야 함..
@@ -351,17 +353,18 @@ static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 	memcpy(xpad->odata, packet->data, packet->len);
 	xpad->irq_out->transfer_buffer_length = packet->len;
 
-
-
 	//check
-	pr_info("xpad->led_command->data[0]:%d,[1]:%d,[2]:%d, with %d len\n",
-			xpad->led_command[XPAD_OUT_LED_IDX].data[0],
-			xpad->led_command[XPAD_OUT_LED_IDX].data[1],
-			xpad->led_command[XPAD_OUT_LED_IDX].data[2],
-			xpad->led_command[XPAD_OUT_LED_IDX].len);
+	//pr_info("xpad->led_command->data[0]:%d,[1]:%d,[2]:%d, with %d len\n",
+	//		xpad->led_command[XPAD_OUT_LED_IDX].data[0],
+	//		xpad->led_command[XPAD_OUT_LED_IDX].data[1],
+	//		xpad->led_command[XPAD_OUT_LED_IDX].data[2],
+	//		xpad->led_command[XPAD_OUT_LED_IDX].len);
 
 	usb_anchor_urb(xpad->irq_out, &xpad->irq_out_anchor);
-	retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+	if(xpad->irq_out_active){
+		retval = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+		xpad->irq_out_active = false;
+	}
 	spin_unlock_irqrestore(&xpad->odata_lock, flags);
 	if (retval){
 		//https://stackoverflow.com/questions/10006071/is-there-an-equvalent-for-perror-in-the-kernel
@@ -394,10 +397,21 @@ static int xpad_led_probe(struct usb_xpad *xpad)
 	struct led_classdev *led_cdev;	//임시 변수
 	int retval;
 	led = kzalloc(sizeof(struct xpad_led), GFP_KERNEL);
+	//ida 할당
+	//pad_nr을 계속 증가..
+	//led가 몇번에 연결되어 있는지 알 수 있음.
+	//0~0x8,000,000 - 1까지 증가
+	xpad->pad_nr = ida_simple_get(&xpad_pad_seq, 0, 0, GFP_KERNEL);
+	if (xpad->pad_nr < 0){
+		retval = xpad->pad_nr;
+		goto free_mem;
+	}
+	//pr_info
+	pr_info("xpad->nr is %d\n",xpad->pad_nr);
+
 	//xpad로 접근하기 쉽게 기록
 	xpad->led = led;
-	snprintf(led->name, sizeof(led->name),"xpad_led");
-
+	snprintf(led->name, sizeof(led->name),"xpad_led%d", xpad->pad_nr);
 	led->xpad = xpad;
 
 	led_cdev = &led->led_cdev;
@@ -407,14 +421,30 @@ static int xpad_led_probe(struct usb_xpad *xpad)
 
 	retval = led_classdev_register(&xpad->udev->dev, led_cdev);
 	if (retval)
-		goto err_free;
+		goto err_free_id;
 
-	led_set_brightness(&xpad->led->led_cdev, 10);
+	led_set_brightness(&xpad->led->led_cdev, (xpad->pad_nr%4) + 6);
 	return 0;
 
-err_free:
+err_free_id:
+	ida_simple_remove(&xpad_pad_seq, xpad->pad_nr);
+	return retval;
+free_mem:
+	kfree(led);
 	return retval;
 }
+
+
+static void xpad_stop_output(struct usb_xpad *xpad){
+	if(!usb_wait_anchor_empty_timeout
+			(&xpad->irq_out_anchor, 5000)){
+		pr_info("%s anchord_urb was stopped\n",__func__);
+		usb_kill_anchored_urbs(&xpad->irq_out_anchor);
+
+	}
+
+}
+
 
 
 static void xpad_led_disconnect(struct usb_xpad *xpad){
@@ -426,8 +456,6 @@ static void xpad_led_disconnect(struct usb_xpad *xpad){
 
 	}
 
-
-
 }
 
 
@@ -435,13 +463,15 @@ static void xpad_disconnect(struct usb_interface *intf)
 {
 	struct usb_xpad *xpad;
 	xpad = usb_get_intfdata(intf);
-	usb_set_intfdata(intf, NULL);
 	pr_info("xpad address is %p, intf is %p\n", xpad, intf);
 	//xpad_deinit_input(xpad);
-	usb_deregister_dev(intf, &xbox_class);
+	xpad_stop_output(xpad);
 	xpad_led_disconnect(xpad);
+	usb_deregister_dev(intf, &xbox_class);
 	free_output(xpad);
 	kfree(xpad);
+
+	usb_set_intfdata(intf, NULL);
 	pr_info("disconnected\n");
 
 }
