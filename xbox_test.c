@@ -35,7 +35,8 @@ struct usb_xpad{
 	__u8    irq_out_endpointAddr;   /* interrupt out address*/
 	struct usb_endpoint_descriptor *endpoint_in, *endpoint_out;
 
-	signed char *data;		/* input data */
+	signed char *idata;		/* input data */
+	dma_addr_t idata_dma;
 	unsigned char *odata;		/* output data */
 	dma_addr_t odata_dma;
 	struct urb *irq_in;		/* urb for interrupt in report*/
@@ -49,6 +50,7 @@ struct usb_xpad{
 	bool irq_out_active;            /* we must not use an active URB */
 	int pad_nr;			// order
 	int last_out_packet;
+	bool input_created;		/* input was created? */
 
 };
 
@@ -64,11 +66,10 @@ struct xpad_led {
 #endif
 
 
-static struct usb_xpad *myPad;
-static int xpad_init_input(struct usb_xpad *xpad);
-static void xpad_deinit_input(struct usb_xpad *xpad);
 static int init_output(struct usb_xpad *xpad,
 		struct usb_endpoint_descriptor *ep_irq_out);
+static int init_input(struct usb_xpad *xpad);
+static void deinit_input(struct usb_xpad *xpad);
 
 static int xpad_led_probe(struct usb_xpad *xpad);
 static void xpad_led_disconnect(struct usb_xpad *xpad);
@@ -119,44 +120,91 @@ static void xpad_irq_outfn(struct urb *urb){
 	spin_unlock_irqrestore(&xpad->odata_lock, flags);
 
 }
+static void xpad360_process_packet(struct usb_xpad *xpad, struct input_dev *dev,
+				   u16 cmd, unsigned char *data)
+{
+
+	return;
+
+}
 
 
-static void usb_xpad_irq(struct urb *urb){
-	struct input_dev *dev;
-	signed char *data;
-	struct usb_xpad *xpad;
-	int status;
-	dev = myPad->dev;
-	xpad = urb->context;
-	data = xpad->data;
-	//pr_info("test\n");
+static void xpad_irq_infn(struct urb *urb)
+{
+	struct usb_xpad *xpad = urb->context;
+	struct device *dev = &xpad->intf->dev;
+	int retval, status;
 
-	switch(urb->status){
-		case 0:			/* success */
+	status = urb->status;
+	/* try */
+	pr_info("%s: submit tried\n",__func__);
+
+
+	switch (status) {
+		case 0:
+			/* success */
+			pr_info("%s: submit suceed\n",__func__);
 			break;
-		case -ECONNRESET:	/* unlink */
+		case -ECONNRESET:
 		case -ENOENT:
 		case -ESHUTDOWN:
+			/* this urb is terminated, clean up */
+			dev_dbg(dev, "%s - urb shutting down with status: %d\n",
+					__func__, status);
 			return;
-			/* -EPIPE:  should clear the halt */
-		default:		/* error */
-			goto resubmit;
+		default:
+			dev_dbg(dev, "%s - nonzero urb status received: %d\n",
+					__func__, status);
+			goto exit;
 	}
-	input_report_key(dev, BTN_A, data[0] & 0x01);
-	input_report_key(dev, BTN_B, data[0] & 0x02);
-	input_report_key(dev, BTN_X, data[0] & 0x04);
-	input_report_key(dev, BTN_Y, data[0] & 0x08);
-	input_report_key(dev, BTN_START, data[1] & 0x10);
-	input_report_key(dev, BTN_SELECT, data[1] & 0x12);
-	input_report_key(dev, BTN_THUMBL, data[1] & 0x14);
-	input_report_key(dev, BTN_THUMBR, data[1] & 0x18);
-	input_sync(dev);
-	//usb_submit_urb(urb, GFP_KERNEL);
-resubmit:
-	status = usb_submit_urb(urb, GFP_ATOMIC);
-	if(status)
-		dev_err(&dev->dev,"error\n");
+
+	xpad360_process_packet(xpad, xpad->dev, 0, xpad->idata);
+
+exit:
+	retval = usb_submit_urb(urb, GFP_ATOMIC);
+	if (retval)
+		dev_err(dev, "%s - usb_submit_urb failed with result %d\n",
+				__func__, retval);
 }
+
+
+
+//static void usb_xpad_irq(struct urb *urb){
+//	struct input_dev *dev;
+//	signed char *data;
+//	struct usb_xpad *xpad;
+//	int status;
+//	dev = myPad->dev;
+//	xpad = urb->context;
+//	data = xpad->idata;
+//	//pr_info("test\n");
+//
+//	switch(urb->status){
+//		case 0:			/* success */
+//			break;
+//		case -ECONNRESET:	/* unlink */
+//		case -ENOENT:
+//		case -ESHUTDOWN:
+//			return;
+//			/* -EPIPE:  should clear the halt */
+//		default:		/* error */
+//			goto resubmit;
+//	}
+//	input_report_key(dev, BTN_A, data[0] & 0x01);
+//	input_report_key(dev, BTN_B, data[0] & 0x02);
+//	input_report_key(dev, BTN_X, data[0] & 0x04);
+//	input_report_key(dev, BTN_Y, data[0] & 0x08);
+//	input_report_key(dev, BTN_START, data[1] & 0x10);
+//	input_report_key(dev, BTN_SELECT, data[1] & 0x12);
+//	input_report_key(dev, BTN_THUMBL, data[1] & 0x14);
+//	input_report_key(dev, BTN_THUMBR, data[1] & 0x18);
+//	input_sync(dev);
+//	//usb_submit_urb(urb, GFP_KERNEL);
+//resubmit:
+//	status = usb_submit_urb(urb, GFP_ATOMIC);
+//	if(status)
+//		dev_err(&dev->dev,"error\n");
+//}
 static ssize_t xbox_read(struct file *file, char *buffer, size_t count,
 		loff_t *ppos)
 {
@@ -224,12 +272,6 @@ static const signed short xpad_common_btn[] = {
 };
 MODULE_DEVICE_TABLE(usb, xpad_table);
 
-static void xpad_deinit_input(struct usb_xpad *xpad)
-{
-	pr_info("xpad is %p, ->dev is %p.\n",xpad, xpad->dev);
-	if(xpad->dev)
-		input_unregister_device(xpad->dev);
-}
 
 static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
@@ -243,7 +285,7 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	//endpoint 2번 한개만 등록..
 	//여기 없으면 인터록으로 설정 가능한 2개 device를 등록함.
 	if (intf->cur_altsetting->desc.bNumEndpoints != 2)
-		goto skip_altsetting;
+		return -ENODEV;
 
 	//register
 	//초기화
@@ -255,7 +297,6 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	xpad->udev = usb_get_dev(interface_to_usbdev(intf));
 	//xpad->odata_serial = 0;
 	xpad->intf = usb_get_intf(intf);
-	myPad = xpad;
 	pr_info("xpad is %p, xpad->udev is %p\n", xpad, xpad->udev);
 	pr_info("interface is %p\n", xpad->intf);
 	pr_info("cur_altsetting is %d\n",intf->cur_altsetting->desc.bNumEndpoints);
@@ -263,8 +304,8 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 
 	/* set up the endpoint information */
 	/* use only the first bulk-in and bulk-out endpoints */
-	//retval = usb_find_common_endpoints(intf->cur_altsetting,NULL,NULL,&itrp_in, &itrp_out);
-	retval = usb_find_last_int_out_endpoint(intf->cur_altsetting,&itrp_out);
+	retval = usb_find_common_endpoints(intf->cur_altsetting,NULL,NULL,&itrp_in, &itrp_out);
+	//retval = usb_find_last_int_out_endpoint(intf->cur_altsetting,&itrp_out);
 
 	xpad->endpoint_in = itrp_in;
 	xpad->endpoint_out = itrp_out;
@@ -294,16 +335,43 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	init_output(xpad, itrp_out);
 	retval = xpad_led_probe(xpad);
 
+	retval = init_input(xpad);
+
+
+
+
 	return 0;
 error:
 	kfree(xpad);
 	return retval;
-skip_altsetting:
-	return -ENODEV;
-
 
 
 }
+
+static int xpad_open(struct input_dev *dev)
+{
+	struct usb_xpad *xpad = input_get_drvdata(dev);
+	int retval;
+	
+	retval = usb_submit_urb(xpad->irq_in, GFP_KERNEL);
+	if( retval)
+	{
+		return retval;
+	}
+	pr_info("%s: opened, xpad is %p\n",__func__, xpad);
+	return 0;
+}
+
+
+static void xpad_close(struct input_dev *dev)
+{
+	struct usb_xpad *xpad = input_get_drvdata(dev);
+	usb_kill_urb(xpad->irq_in);
+	pr_info("%s: closed\n",__func__);
+
+
+}
+
 
 static int init_output(struct usb_xpad *xpad,
 		struct usb_endpoint_descriptor *ep_irq_out){
@@ -346,13 +414,73 @@ err_free_coherent:
 
 	return retval;
 }
+static int init_input(struct usb_xpad *xpad)
+{
+	int retval, pipe;
+	int i;
+	struct input_dev *input_dev;
+	input_dev = input_allocate_device();
+
+	if (!input_dev)
+	{
+		return -ENOMEM;
+
+	}
+	xpad->dev = input_dev;
+	xpad->idata = usb_alloc_coherent(xpad->udev, XPAD_PKT_LEN, GFP_KERNEL, &xpad->idata_dma); 
+
+	xpad->irq_in = usb_alloc_urb(0, GFP_KERNEL);
+	pr_info("input urb allocated\n");
+
+	//urb settup
+	pipe = usb_rcvintpipe(xpad->udev, xpad->endpoint_in->bEndpointAddress);
+	usb_fill_int_urb(xpad->irq_in, xpad->udev, pipe,
+			xpad->idata, XPAD_PKT_LEN,
+			xpad_irq_infn, xpad, xpad->endpoint_in->bInterval);
+
+	xpad->irq_in->transfer_dma = xpad->idata_dma;
+	xpad->irq_in->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+
+	input_set_drvdata(input_dev, xpad);
+	input_dev->open = xpad_open;
+	input_dev->close = xpad_close;
+
+	/* set up standard buttons */
+	for (i = 0; xpad_common_btn[i] >= 0; i++)
+		input_set_capability(input_dev, EV_KEY, xpad_common_btn[i]);
+
+	retval = input_register_device(xpad->dev);
+	if( retval )
+	{
+		goto err_register;
+
+	}
+	xpad->input_created = true;
+	pr_info("%s: executed\n",__func__);
+	return 0;
+err_register:
+	return retval;
+}
+
+static void deinit_input(struct usb_xpad *xpad)
+{
+	pr_info("%s: deinited\n",__func__);
+	if(xpad->input_created)
+		input_unregister_device(xpad->dev);
+	usb_free_urb(xpad->irq_in);
+	usb_free_coherent(xpad->udev, XPAD_PKT_LEN, xpad->idata, xpad->idata_dma);
+	pr_info("dma input address %p with size %d was freed\n", &xpad->idata_dma, XPAD_PKT_LEN);
+
+
+}
 
 
 static void free_output(struct usb_xpad *xpad)
 {
 	usb_free_urb(xpad->irq_out);
-	pr_info("dma output address %p with size %d was freed\n", &xpad->odata_dma, XPAD_PKT_LEN);
 	usb_free_coherent(xpad->udev, XPAD_PKT_LEN, xpad->odata, xpad->odata_dma);
+	pr_info("dma output address %p with size %d was freed\n", &xpad->odata_dma, XPAD_PKT_LEN);
+
 
 
 }
@@ -519,8 +647,8 @@ static void xpad_disconnect(struct usb_interface *intf)
 {
 	struct usb_xpad *xpad;
 	xpad = usb_get_intfdata(intf);
-	//pr_info("xpad address is %p, intf is %p\n", xpad, intf);
-	//xpad_deinit_input(xpad);
+	pr_info("xpad address is %p, intf is %p\n", xpad, intf);
+	deinit_input(xpad);
 	xpad_stop_output(xpad);
 	xpad_led_disconnect(xpad);
 	usb_deregister_dev(intf, &xbox_class);
