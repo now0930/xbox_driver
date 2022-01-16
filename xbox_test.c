@@ -124,7 +124,16 @@ static void xpad360_process_packet(struct usb_xpad *xpad, struct input_dev *dev,
 				   u16 cmd, unsigned char *data)
 {
 
-	return;
+	if (data[0] != 0x00)
+		return;
+	/* buttons A,B,X,Y,TL,TR and MODE */
+	input_report_key(dev, BTN_A,	data[3] & 0x10);
+	input_report_key(dev, BTN_B,	data[3] & 0x20);
+	input_report_key(dev, BTN_X,	data[3] & 0x40);
+	input_report_key(dev, BTN_Y,	data[3] & 0x80);
+
+	input_sync(dev);
+
 
 }
 
@@ -137,13 +146,13 @@ static void xpad_irq_infn(struct urb *urb)
 
 	status = urb->status;
 	/* try */
-	pr_info("%s: submit tried\n",__func__);
+	//pr_info("%s: submit tried\n",__func__);
 
 
 	switch (status) {
 		case 0:
 			/* success */
-			pr_info("%s: submit suceed\n",__func__);
+			//pr_info("%s: submit suceed\n",__func__);
 			break;
 		case -ECONNRESET:
 		case -ENOENT:
