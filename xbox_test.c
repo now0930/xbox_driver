@@ -8,7 +8,7 @@
 #include <linux/slab.h>
 
 #define USB_XBOX_MINOR_BASE	120
-#define XPAD_PKT_LEN 64
+#define XPAD_PKT_LEN 20 
 #define XPAD_OUT_CMD_IDX	0
 #define XPAD_OUT_FF_IDX		1
 #define XPAD_OUT_LED_IDX	(1 + IS_ENABLED(CONFIG_JOYSTICK_XPAD_FF))
@@ -127,10 +127,26 @@ static void xpad360_process_packet(struct usb_xpad *xpad, struct input_dev *dev,
 	if (data[0] != 0x00)
 		return;
 	/* buttons A,B,X,Y,TL,TR and MODE */
-	input_report_key(dev, BTN_A,	data[3] & 0x10);
-	input_report_key(dev, BTN_B,	data[3] & 0x20);
-	input_report_key(dev, BTN_X,	data[3] & 0x40);
-	input_report_key(dev, BTN_Y,	data[3] & 0x80);
+	input_report_key(dev, BTN_A,		data[3] & 0x10);
+	input_report_key(dev, BTN_B,		data[3] & 0x20);
+	input_report_key(dev, BTN_Y,		data[3] & 0x40);
+	input_report_key(dev, BTN_X,		data[3] & 0x80);
+
+	input_report_key(dev, BTN_THUMBL,	data[3] & 0x01);
+	input_report_key(dev, BTN_THUMBR,	data[3] & 0x02);
+
+	input_report_key(dev, BTN_START,	data[2] & 0x10);
+	input_report_key(dev, BTN_BACK,		data[2] & 0x20);
+
+	input_report_key(dev, BTN_TRIGGER_HAPPY1,data[2] & 0x01);
+	input_report_key(dev, BTN_TRIGGER_HAPPY2,data[2] & 0x02);
+	input_report_key(dev, BTN_TRIGGER_HAPPY3,data[2] & 0x04);
+	input_report_key(dev, BTN_TRIGGER_HAPPY4,data[2] & 0x08);
+
+
+
+	input_report_abs(dev, ABS_Z, data[4]);
+	input_report_abs(dev, ABS_RZ, data[5]);
 
 	input_sync(dev);
 
@@ -276,9 +292,26 @@ static const struct usb_device_id xpad_table[] = {
 };
 static const signed short xpad_common_btn[] = {
 	BTN_A, BTN_B, BTN_X, BTN_Y,			/* "analog" buttons */
-	BTN_START, BTN_SELECT, BTN_THUMBL, BTN_THUMBR,	/* start/back/sticks */
+	BTN_START, BTN_BACK, BTN_THUMBL, BTN_THUMBR,	/* start/back/sticks */
 	-1						/* terminating entry */
 };
+
+/* used when triggers are mapped to buttons */
+static const signed short xpad_btn_triggers[] = {
+	ABS_Z, ABS_RZ,		/* triggers left/right */
+	-1
+};
+
+/* used when dpad is mapped to buttons */
+static const signed short xpad_btn_pad[] = {
+	BTN_TRIGGER_HAPPY1, BTN_TRIGGER_HAPPY2,		/* d-pad left, right */
+	BTN_TRIGGER_HAPPY3, BTN_TRIGGER_HAPPY4,		/* d-pad up, down */
+	-1				/* terminating entry */
+};
+
+
+
+
 MODULE_DEVICE_TABLE(usb, xpad_table);
 
 
@@ -457,6 +490,15 @@ static int init_input(struct usb_xpad *xpad)
 	/* set up standard buttons */
 	for (i = 0; xpad_common_btn[i] >= 0; i++)
 		input_set_capability(input_dev, EV_KEY, xpad_common_btn[i]);
+
+	/* set up d pad*/
+	for (i = 0; xpad_btn_pad[i] >= 0; i++)
+		input_set_capability(input_dev, EV_KEY, xpad_btn_pad[i]);
+
+	/* set up triggers*/
+	for (i = 0; xpad_btn_triggers[i] >= 0; i++)
+		input_set_abs_params(input_dev, xpad_btn_triggers[i],0,255,0,0);
+
 
 	retval = input_register_device(xpad->dev);
 	if( retval )
