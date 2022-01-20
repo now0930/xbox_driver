@@ -47,10 +47,14 @@ struct usb_xpad{
 	struct xpad_led *led;		/* led*/
 	struct xpad_output_packet led_command[XPAD_NUM_OUT_PACKETS];	/*led command*/
 	spinlock_t odata_lock;
+	spinlock_t idata_lock;
 	bool irq_out_active;            /* we must not use an active URB */
 	int pad_nr;			// order
 	int last_out_packet;
 	bool input_created;		/* input was created? */
+	bool mouse_mode;		/* xbox 360 as mouse, false: joystick, true: mouse*/
+	int r_edge;		/*edge filter, 0b100이면 동작*/
+
 
 };
 
@@ -75,6 +79,7 @@ static int xpad_led_probe(struct usb_xpad *xpad);
 static void xpad_led_disconnect(struct usb_xpad *xpad);
 static void xpad_irq_outfn(struct urb *urb);
 static bool xpad_prepare_next_out_packet(struct usb_xpad *xpad);
+static void xpad_send_led_command(struct usb_xpad *xpad, int command);
 
 
 static void xpad_irq_outfn(struct urb *urb){
@@ -88,7 +93,7 @@ static void xpad_irq_outfn(struct urb *urb){
 	switch (status){
 		case 0:
 			/* success */
-			pr_info("%s: submit completed\n",__func__);
+			//pr_info("%s: submit completed\n",__func__);
 			//무제한으로 실행하지 않도록 방지
 			xpad->irq_out_active = xpad_prepare_next_out_packet(xpad);
 			break;
@@ -123,35 +128,71 @@ static void xpad_irq_outfn(struct urb *urb){
 static void xpad360_process_packet(struct usb_xpad *xpad, struct input_dev *dev,
 				   u16 cmd, unsigned char *data)
 {
-
 	if (data[0] != 0x00)
 		return;
-	/* buttons A,B,X,Y,TL,TR and MODE */
-	input_report_key(dev, BTN_A,		data[3] & 0x10);
-	input_report_key(dev, BTN_B,		data[3] & 0x20);
-	input_report_key(dev, BTN_Y,		data[3] & 0x40);
-	input_report_key(dev, BTN_X,		data[3] & 0x80);
 
-	input_report_key(dev, BTN_THUMBL,	data[3] & 0x01);
-	input_report_key(dev, BTN_THUMBR,	data[3] & 0x02);
 
-	input_report_key(dev, BTN_START,	data[2] & 0x10);
 	input_report_key(dev, BTN_BACK,		data[2] & 0x20);
+	input_report_key(dev, BTN_START,	data[2] & 0x10);
 
-	input_report_key(dev, BTN_TRIGGER_HAPPY1,data[2] & 0x01);
-	input_report_key(dev, BTN_TRIGGER_HAPPY2,data[2] & 0x02);
-	input_report_key(dev, BTN_TRIGGER_HAPPY3,data[2] & 0x04);
-	input_report_key(dev, BTN_TRIGGER_HAPPY4,data[2] & 0x08);
+	if(!xpad->mouse_mode){
+		/* buttons A,B,X,Y,TL,TR and MODE */
+		input_report_key(dev, BTN_Y,		data[3] & 0x40);
+		input_report_key(dev, BTN_X,		data[3] & 0x80);
+		input_report_key(dev, BTN_A,		data[3] & 0x10);
+		input_report_key(dev, BTN_B,		data[3] & 0x20);
+
+		input_report_key(dev, BTN_THUMBL,	data[3] & 0x01);
+		input_report_key(dev, BTN_THUMBR,	data[3] & 0x02);
+
+		input_report_key(dev, BTN_TRIGGER_HAPPY1,data[2] & 0x01);
+		input_report_key(dev, BTN_TRIGGER_HAPPY2,data[2] & 0x02);
+		input_report_key(dev, BTN_TRIGGER_HAPPY3,data[2] & 0x04);
+		input_report_key(dev, BTN_TRIGGER_HAPPY4,data[2] & 0x08);
+		input_report_abs(dev, ABS_Z, data[4]);
+		input_report_abs(dev, ABS_RZ, data[5]);
+	}
+
+	else{
+		input_report_key(xpad->dev, BTN_LEFT, xpad->idata[3] & 0x10);
+		input_report_key(xpad->dev, BTN_RIGHT, xpad->idata[3] & 0x20);
 
 
-
-	input_report_abs(dev, ABS_Z, data[4]);
-	input_report_abs(dev, ABS_RZ, data[5]);
-
+	}
 	input_sync(dev);
 
+	/* rising edge, falling edge 두 번 동작*/
+	if (data[3] & 0x04){		/*xbox lamp 버튼*/
+		xpad->r_edge = xpad->r_edge << 1;
+		//pr_info("%s: hit x button \n",__func__);
+		//pr_info("value: %x\n", xpad->r_edge);
+	}
 
 }
+
+
+static void mouse_change(struct work_struct *work)
+{
+	struct usb_xpad *xpad = container_of(work, struct usb_xpad, work);
+	unsigned char *data;
+	data = xpad->idata;
+
+	if(xpad->r_edge == 0b100){
+		/* 과거 기록을 보고 모드 변환*/
+		xpad->mouse_mode = !xpad->mouse_mode;
+		xpad->r_edge = 1;
+	}
+
+
+	/* Lamp 버튼을 모드 체인지로 사용*/
+	if(xpad->mouse_mode){
+		led_set_brightness(&xpad->led->led_cdev, 10);
+	}
+	else
+		led_set_brightness(&xpad->led->led_cdev, (xpad->pad_nr%4) + 6);
+
+}
+
 
 
 static void xpad_irq_infn(struct urb *urb)
@@ -184,6 +225,7 @@ static void xpad_irq_infn(struct urb *urb)
 	}
 
 	xpad360_process_packet(xpad, xpad->dev, 0, xpad->idata);
+	schedule_work(&xpad->work);
 
 exit:
 	retval = usb_submit_urb(urb, GFP_ATOMIC);
@@ -324,6 +366,7 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	struct usb_endpoint_descriptor *itrp_in, *itrp_out;
 	int retval;
 
+
 	//endpoint 2번 한개만 등록..
 	//여기 없으면 인터록으로 설정 가능한 2개 device를 등록함.
 	if (intf->cur_altsetting->desc.bNumEndpoints != 2)
@@ -335,6 +378,12 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	xpad = kzalloc(sizeof(struct usb_xpad), GFP_KERNEL);
 	if (!xpad)
 		return -ENOMEM;
+
+	//init work queue
+	INIT_WORK(&xpad->work, mouse_change); 
+	xpad->mouse_mode = false;
+	xpad->r_edge = 1;
+
 
 	xpad->udev = usb_get_dev(interface_to_usbdev(intf));
 	//xpad->odata_serial = 0;
@@ -401,6 +450,7 @@ static int xpad_open(struct input_dev *dev)
 		return retval;
 	}
 	pr_info("%s: opened, xpad is %p\n",__func__, xpad);
+
 	return 0;
 }
 
@@ -409,6 +459,7 @@ static void xpad_close(struct input_dev *dev)
 {
 	struct usb_xpad *xpad = input_get_drvdata(dev);
 	usb_kill_urb(xpad->irq_in);
+	flush_work(&xpad->work);
 	pr_info("%s: closed\n",__func__);
 
 
@@ -500,6 +551,11 @@ static int init_input(struct usb_xpad *xpad)
 		input_set_abs_params(input_dev, xpad_btn_triggers[i],0,255,0,0);
 
 
+	/* work queue 대용 */
+	input_set_capability(input_dev, EV_KEY, BTN_LEFT);
+	input_set_capability(input_dev, EV_KEY, BTN_RIGHT);
+
+
 	retval = input_register_device(xpad->dev);
 	if( retval )
 	{
@@ -584,7 +640,7 @@ static int xpad_try_sending_next_output(struct usb_xpad *xpad)
 			return -EIO;
 		}
 		else
-			pr_info("%s: completed\n",__func__);
+			//pr_info("%s: completed\n",__func__);
 		xpad->irq_out_active = true;
 	}
 
@@ -595,13 +651,10 @@ static int xpad_try_sending_next_output(struct usb_xpad *xpad)
 
 static void xpad_send_led_command(struct usb_xpad *xpad, int command)
 {
-	int retval;
+	unsigned long flags;
 	struct xpad_output_packet *packet;
 	packet = &xpad->led_command[XPAD_OUT_LED_IDX];
-	unsigned long flags;
 	command %= 16;
-
-
 	spin_lock_irqsave(&xpad->odata_lock, flags);
 	packet->data[0] = 0x01;
 	packet->data[1] = 0x03;
