@@ -50,12 +50,20 @@ struct usb_xpad{
 	spinlock_t idata_lock;
 	bool irq_out_active;            /* we must not use an active URB */
 	int pad_nr;			// order
+	char *name;			/* device name*/
 	int last_out_packet;
 	bool input_created;		/* input was created? */
 	bool mouse_mode;		/* xbox 360 as mouse, false: joystick, true: mouse*/
 	int r_edge;		/*edge filter, 0b100이면 동작*/
 
 
+};
+
+static const struct xpad_device{
+	char *name;
+}	
+xpad_device[]={
+	{"xbox360 test driver"}
 };
 
 #if defined(CONFIG_JOYSTICK_XPAD_LEDS)
@@ -175,12 +183,19 @@ static void mouse_change(struct work_struct *work)
 {
 	struct usb_xpad *xpad = container_of(work, struct usb_xpad, work);
 	unsigned char *data;
+	int *edge;
 	data = xpad->idata;
+	edge = &xpad->r_edge;
 
-	if(xpad->r_edge == 0b100){
+	if( *edge==0b100 ){
 		/* 과거 기록을 보고 모드 변환*/
 		xpad->mouse_mode = !xpad->mouse_mode;
-		xpad->r_edge = 1;
+		*edge = 1;
+	}
+
+	/* 특정 수가 넘어가면 다시 초기화*/
+	if ( *edge > 0b100){
+		*edge = 1;
 	}
 
 
@@ -378,6 +393,9 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	xpad = kzalloc(sizeof(struct usb_xpad), GFP_KERNEL);
 	if (!xpad)
 		return -ENOMEM;
+
+
+	xpad->name=xpad_device[0].name;
 
 	//init work queue
 	INIT_WORK(&xpad->work, mouse_change); 
