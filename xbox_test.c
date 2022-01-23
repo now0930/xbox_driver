@@ -159,12 +159,22 @@ static void xpad360_process_packet(struct usb_xpad *xpad, struct input_dev *dev,
 		input_report_key(dev, BTN_TRIGGER_HAPPY4,data[2] & 0x08);
 		input_report_abs(dev, ABS_Z, data[4]);
 		input_report_abs(dev, ABS_RZ, data[5]);
+		
+
+		/* set up axises*/
+		input_report_abs(dev, ABS_X, (__s16) le16_to_cpup((__le16 *)(data + 6)));
+		input_report_abs(dev, ABS_Y, (__s16) le16_to_cpup((__le16 *)(data + 8)));
+		input_report_abs(dev, ABS_RX,(__s16) le16_to_cpup((__le16 *)(data + 10)));
+		input_report_abs(dev, ABS_RY,(__s16) le16_to_cpup((__le16 *)(data + 12)));
+
+
 	}
 
 	else{
-		input_report_key(xpad->dev, BTN_LEFT, xpad->idata[3] & 0x10);
-		input_report_key(xpad->dev, BTN_RIGHT, xpad->idata[3] & 0x20);
-
+		input_report_key(dev, BTN_LEFT, xpad->idata[3] & 0x10);
+		input_report_key(dev, BTN_RIGHT, xpad->idata[3] & 0x20);
+		input_report_rel(dev, REL_X, (__s16) le16_to_cpup((__le16 *)(data + 6)));
+		input_report_rel(dev, REL_Y, (__s16) le16_to_cpup((__le16 *)(data + 8)));
 
 	}
 	input_sync(dev);
@@ -368,6 +378,22 @@ static const signed short xpad_btn_pad[] = {
 
 
 
+static const signed short xpad_abs[] = {
+	ABS_X, ABS_Y,		/* left stick */
+	ABS_RX, ABS_RY,		/* right stick */
+	-1			/* terminating entry */
+};
+
+
+static const signed short xpad_rel[] = {
+
+	REL_X, REL_Y,		/*mouse emulate*/
+	-1
+};
+
+
+
+
 
 MODULE_DEVICE_TABLE(usb, xpad_table);
 
@@ -568,6 +594,18 @@ static int init_input(struct usb_xpad *xpad)
 	for (i = 0; xpad_btn_triggers[i] >= 0; i++)
 		input_set_abs_params(input_dev, xpad_btn_triggers[i],0,255,0,0);
 
+
+	/* set up axis*/
+	for (i = 0; xpad_abs[i] >= 0; i++){
+		input_set_abs_params(input_dev, xpad_abs[i],0,255,0,0);
+	}
+
+
+	/* set up mouse relative coordinate */
+	for (i = 0; xpad_rel[i] >= 0; i++){
+		input_set_capability(input_dev, EV_REL, xpad_rel[i]);
+
+	}
 
 	/* work queue 대용 */
 	input_set_capability(input_dev, EV_KEY, BTN_LEFT);
