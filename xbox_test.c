@@ -136,6 +136,9 @@ static void xpad_irq_outfn(struct urb *urb){
 static void xpad360_process_packet(struct usb_xpad *xpad, struct input_dev *dev,
 				   u16 cmd, unsigned char *data)
 {
+	int rel_x, rel_y; /* relative movement.to scale*/
+	rel_x=0;
+	rel_y=0;
 	if (data[0] != 0x00)
 		return;
 
@@ -171,11 +174,14 @@ static void xpad360_process_packet(struct usb_xpad *xpad, struct input_dev *dev,
 	}
 
 	else{
+		rel_x = (__s16) le16_to_cpup((__le16 *)(data + 6))/2000;
+		rel_y = -(__s16) le16_to_cpup((__le16 *)(data + 8))/2000;
+
+
 		input_report_key(dev, BTN_LEFT, xpad->idata[3] & 0x10);
 		input_report_key(dev, BTN_RIGHT, xpad->idata[3] & 0x20);
-		input_report_rel(dev, REL_X, (__s16) le16_to_cpup((__le16 *)(data + 6)));
-		input_report_rel(dev, REL_Y, (__s16) le16_to_cpup((__le16 *)(data + 8)));
-
+		input_report_rel(dev, REL_X, rel_x);
+		input_report_rel(dev, REL_Y, rel_y);
 	}
 	input_sync(dev);
 
@@ -423,6 +429,9 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 
 	xpad->name=xpad_device[0].name;
 
+
+
+
 	//init work queue
 	INIT_WORK(&xpad->work, mouse_change); 
 	xpad->mouse_mode = false;
@@ -430,6 +439,12 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 
 
 	xpad->udev = usb_get_dev(interface_to_usbdev(intf));
+
+	/* usb make path.*/
+	usb_make_path(xpad->udev, xpad->phys, sizeof(xpad->phys));
+	strlcat(xpad->phys, "/input0", sizeof(xpad->phys));
+	pr_info("phys: %s\n", xpad->phys);
+
 	//xpad->odata_serial = 0;
 	xpad->intf = usb_get_intf(intf);
 	pr_info("xpad is %p, xpad->udev is %p\n", xpad, xpad->udev);
@@ -564,6 +579,11 @@ static int init_input(struct usb_xpad *xpad)
 
 	}
 	xpad->dev = input_dev;
+
+	/* name을 설정해야 xserver에 기록됨*/
+	input_dev->name = xpad->name;
+	input_dev->phys = xpad->phys;
+
 	xpad->idata = usb_alloc_coherent(xpad->udev, XPAD_PKT_LEN, GFP_KERNEL, &xpad->idata_dma); 
 
 	xpad->irq_in = usb_alloc_urb(0, GFP_KERNEL);
